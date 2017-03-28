@@ -1,0 +1,6 @@
+[submodule "vendor/redpoint"]
+	path = vendor/redpoint
+	url = https://github.com/UAV-sjtu/redpoint.git
+[submodule "vendor/Car_detect"]
+	path = vendor/Car_detect
+	url = https://github.com/UAV-sjtu/Car_detect.git
