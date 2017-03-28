@@ -1,0 +1,529 @@
+#include <ros/ros.h>
+#include <mavros_msgs/mavlink_convert.h>
+#include <geometry_msgs/PoseStamped.h>
+#include <std_msgs/Float64.h>
+#include <mavros_msgs/CommandBool.h>
+#include <mavros_msgs/State.h>
+#include <mavros_msgs/Mavlink.h>
+#include <sensor_msgs/Imu.h>
+#include <cv_bridge/cv_bridge.h>
+#include <image_transport/image_transport.h>
+#include <sensor_msgs/image_encodings.h>
+
+//#include <opencv2/opencv.hpp>
+//#include <opencv2/cxcore.h>
+#include <cv.h>
+#include <cxcore.h>
+#include <highgui.h>
+#include <Eigen/Dense>
+
+#include <iostream>
+#include <fstream>
+using namespace std;
+using namespace Eigen;
+mavros_msgs::State current_state;
+mavros_msgs::Mavlink current_mav;
+mavlink_message_t mmsg;
+mavlink_attitude_t attitude;
+mavlink_local_position_ned_t localpos;
+geometry_msgs::PoseStamped pose;
+cv_bridge::CvImage img_msg;
+
+float roll,pitch,yaw,yawspeed,quat[4];
+float rolld=0,pitchd=0,roll1=0,roll2=0, pitch1=0, pitch2=0;
+int i;
+float hd,z,v;
+void psort(float a[])  //a={x1,y1,x2,y2,x3,y3,x4,y4}
+{     
+    float tempx,tempy;
+    for(int i=0;i<2;i++)
+    {
+        for(int j=i;j<3;j++)
+        {
+            if(a[j*2]<a[j*2+2])
+            {
+                tempx=a[j*2];
+                tempy=a[j*2+1];
+                a[j*2]=a[j*2+2];
+                a[j*2+1]=a[j*2+3];
+                a[j*2+2]=tempx;
+                a[j*2+3]=tempy;
+            }
+        }
+    }
+
+    if(a[1]>a[3])
+    {
+        tempx=a[0];
+        tempy=a[1];
+        a[0]=a[2];
+        a[1]=a[3];
+        a[2]=tempx;
+        a[3]=tempy;
+    }
+    if(a[5]>a[7])
+    {
+        tempx=a[4];
+        tempy=a[5];
+        a[4]=a[6];
+        a[5]=a[7];
+        a[6]=tempx;
+        a[7]=tempy;
+    }
+}
+
+void state_cb(const mavros_msgs::State::ConstPtr& msg){
+    current_state = *msg;
+}
+
+void mav_cb(const mavros_msgs::Mavlink::ConstPtr& msg){
+    current_mav = *msg;
+    mavros_msgs::mavlink::convert(current_mav, mmsg);
+    switch (mmsg.msgid){
+        case MAVLINK_MSG_ID_ATTITUDE:
+            mavlink_msg_attitude_decode(&mmsg,&attitude);
+            roll1=attitude.roll;
+            pitch1=attitude.pitch;
+            yaw=attitude.yaw;
+            yawspeed=attitude.yawspeed;
+            // mavlink_euler_to_quaternion(attitude.roll,attitude.pitch,attitude.yaw,q);
+            break;
+        case MAVLINK_MSG_ID_LOCAL_POSITION_NED:
+            mavlink_msg_local_position_ned_decode(&mmsg,&localpos);
+            z=-localpos.z;
+            v=-localpos.vz;
+            break;
+
+    }
+    
+}
+
+int main(int argc, char **argv)
+{
+    
+    /***************************************
+    *
+    * FourP Variables 
+    *
+    ***************************************/
+    bool isfirst=true; 
+    int reason=0;
+    float fl=0.0036,ad=0.00000045,qzd=1,qxd=0,qyd=0,alphad=0,dt=0.04,
+            zd=1.5,c1=1,k1=4,k2=4,c2=2,mass=1.56,gra=mass*9.81; 
+    float rp_thr=0.173,thr_sp=0.660,r_err=0,p_err=0;
+    //0.17365;  
+    float m[4],u[4],v[4];
+    float m10,m00,m01,ug,vg,u20,u02,u11,a1,qz,qx,qy,u1,alpha,q4;
+    /***************************************
+    *
+    * PID Variables 
+    *
+    ***************************************/
+    float pE=0,iE=0,dE=0,ek=0,ek1=0,ek2=0;
+    float kp=0,ki=0,kd=0;
+    //Matrix and vectors
+    Matrix3f Rx4,Rx5,R;
+    Vector3f p[4],tmpv_arr[4],q,q1,tmpv,voe,dvoe,qe1,dqe1,qee,ve,q2,f;
+    RowVector3f tmph;
+    /***************************************
+    *
+    * Flying log 
+    *
+    ***************************************/
+    int linecnt=0,filecnt=0;
+    ofstream outfile("log.txt");
+    outfile<<"time\tx1\tx2\tx3\tx4\ty1\ty2\ty3\ty4\treason\tisfirst\t"
+            <<"cnt\t"
+            <<"u1\tu2\tu3\tu4\tv1\tv2\tv3\tv4\t"
+            <<"a\t"
+            <<"q11\tq12\tq13\t"
+            <<"qee1\tqee2\tqee3\t"
+            <<"ve1\tve2\tve3\t"
+            <<"voe1\tvoe2\tvoe3\t"
+            <<"dvoe1\tdvoe2\tdvoe3\t"
+            <<"qe11\tqe12\tqe13\t"
+            <<"dqe11\tdqe12\tdqe13\t"
+            <<"q21\tq22\tq23\t"
+            <<"f1\tf2\tf3\t"
+            <<"u1\trolld\tpitchd\tthrustd\t"
+            <<"roll\tpitch\t"
+            <<"roll1\tpitch1\t"
+            <<"yawspeed"
+            <<endl;
+
+    
+    ifstream infile("para.txt");
+    infile>>kp>>ki>>kd>>thr_sp>>r_err>>p_err;
+    infile.close();
+    /***************************************
+    *
+    *  ROS
+    *
+    ***************************************/
+    ros::init(argc, argv, "fourp");
+    ros::NodeHandle nh, mav_sub_handle, att_pub_handle,att_thr_pub_handle,img_pub_handle ;
+    ros::Subscriber state_sub = nh.subscribe<mavros_msgs::State>
+            ("mavros/state", 10, state_cb);
+    ros::Subscriber mav_sub=mav_sub_handle.subscribe<mavros_msgs::Mavlink>
+            ("mavlink/from",10,mav_cb);
+
+    ros::Publisher local_pos_pub = nh.advertise<geometry_msgs::PoseStamped>
+            ("mavros/setpoint_position/local", 10);
+    ros::Publisher att_pub = att_pub_handle.advertise<geometry_msgs::PoseStamped>
+            ("mavros/setpoint_attitude/attitude", 10);
+    ros::Publisher att_thr_pub = att_thr_pub_handle.advertise<std_msgs::Float64>
+            ("mavros/setpoint_attitude/att_throttle", 10);
+    ros::Publisher img_pub=img_pub_handle.advertise<sensor_msgs::Image>
+            ("image",10);
+
+    ros::Rate rate(30.0);
+
+    // wait for FCU connection
+    while(ros::ok() && current_state.connected){
+        ros::spinOnce();
+        rate.sleep();
+    }
+    geometry_msgs::PoseStamped attitude;
+    std_msgs::Float64 thrustd;
+    thrustd.data=thr_sp;
+
+    /***************************************
+    *
+    *  OpenCV
+    *
+    ***************************************/
+    IplImage* pFrame = NULL;
+    CvCapture* pCapture = cvCreateCameraCapture(-1);    // -1 means to prompt a window of cameras for user to choose
+
+    //Frame Width and Height
+    cvSetCaptureProperty(pCapture, CV_CAP_PROP_FRAME_WIDTH, 480);
+    cvSetCaptureProperty(pCapture, CV_CAP_PROP_FRAME_HEIGHT, 270);
+    pFrame=cvQueryFrame( pCapture );    // fetch a frame from camera
+    
+    IplImage* rgbImg = cvCreateImage(cvGetSize(pFrame), IPL_DEPTH_8U, 3);
+    IplImage* r1Img = cvCreateImage(cvGetSize(pFrame), IPL_DEPTH_8U, 1);
+    IplImage* g1Img = cvCreateImage(cvGetSize(pFrame), IPL_DEPTH_8U, 1);
+    IplImage* b1Img = cvCreateImage(cvGetSize(pFrame), IPL_DEPTH_8U, 1);
+    IplImage* r2Img = cvCreateImage(cvGetSize(pFrame), IPL_DEPTH_8U, 1);
+    IplImage* g2Img = cvCreateImage(cvGetSize(pFrame), IPL_DEPTH_8U, 1);
+    IplImage* b2Img = cvCreateImage(cvGetSize(pFrame), IPL_DEPTH_8U, 1);
+ 
+    IplImage* hsvImg=cvCreateImage(cvGetSize(pFrame),IPL_DEPTH_8U,3); //sexiang baohedu liangdu
+    IplImage* hImg=cvCreateImage(cvGetSize(pFrame),IPL_DEPTH_8U,1);
+    IplImage* h1Img=cvCreateImage(cvGetSize(pFrame),IPL_DEPTH_8U,1);    
+    IplImage* sImg=cvCreateImage(cvGetSize(pFrame),IPL_DEPTH_8U,1);    
+    IplImage* vImg=cvCreateImage(cvGetSize(pFrame),IPL_DEPTH_8U,1);
+    
+    CvMemStorage *storage = cvCreateMemStorage();  //64k per block
+    CvSeq *seq = NULL;  // ?????????????????????????????
+    CvSeq *c = NULL; 
+    int cnt,piccnt=0;
+    char buffer[20];
+    float x[4],y[4],a[8];
+    
+    CvScalar cs;    // 4 float
+    CvRect rc;  // x y width height
+    
+    CvVideoWriter *writer=cvCreateVideoWriter("video.avi",CV_FOURCC('M','J','P','G'),5,cvGetSize(pFrame));
+    //  ( const char* filename, int fourcc, double fps, CvSize frame_size, int is_color=1 )
+    // CV_FOURCC('M','J','P','G') = motion-jpeg codec
+    //fps 被创建视频流的帧率。
+    //frame_size 视频流的大小。
+
+    /***************************************
+    *
+    *  Calculating and Publishing
+    *
+    ***************************************/
+    while(ros::ok()) {
+        pFrame=cvQueryFrame( pCapture );
+        if(!pFrame)break;
+        cvCopy(pFrame,rgbImg);
+        
+        cvSplit(rgbImg, b1Img, g1Img, r1Img, NULL);
+        /*
+        void cvThreshold( const CvArr* src,CvArr* dst,double threshold,double max_value,int threshold_type );
+        src：原始数组 (单通道 , 8-bit of 32-bit 浮点数)。
+        dst：输出数组，必须与 src 的类型一致，或者为 8-bit。
+        threshold：阈值
+        max_value：使用 CV_THRESH_BINARY 和 CV_THRESH_BINARY_INV 的最大值。
+        threshold_type：阈值类型
+        threshold_type=CV_THRESH_BINARY:如果 src(x,y)>threshold ,dst(x,y) = max_value; 否则,dst（x,y）=0;
+        threshold_type=CV_THRESH_BINARY_INV:如果 src(x,y)>threshold,dst(x,y) = 0; 否则,dst(x,y) = max_value.
+        threshold_type=CV_THRESH_TRUNC:如果 src(x,y)>threshold，dst(x,y) = max_value; 否则dst(x,y) = src(x,y).
+        threshold_type=CV_THRESH_TOZERO:如果src(x,y)>threshold，dst(x,y) = src(x,y) ; 否则 dst(x,y) = 0。
+        threshold_type=CV_THRESH_TOZERO_INV:如果 src(x,y)>threshold，dst(x,y) = 0 ; 否则dst(x,y) = src(x,y).
+        */
+        //rgb
+        cvThreshold(r1Img, r2Img, 180, 255, CV_THRESH_BINARY);
+        cvThreshold(r1Img, r1Img, 240, 255, CV_THRESH_BINARY_INV);
+        cvAnd(r1Img, r2Img, r1Img);    //dst(I)=src1(I)&src2(I) if mask(I)!=0 180-240
+        cvThreshold(g1Img, g2Img, 90, 255, CV_THRESH_BINARY);
+        cvThreshold(g1Img, g1Img, 150, 255, CV_THRESH_BINARY_INV);
+        cvAnd(g1Img, g2Img, g1Img);
+        cvThreshold(b1Img, b2Img, 110, 255, CV_THRESH_BINARY);
+        cvThreshold(b1Img, b1Img, 230, 255, CV_THRESH_BINARY_INV);
+        cvAnd(b1Img, b2Img, b1Img);
+        cvAnd(r1Img, g1Img, r1Img);
+        cvAnd(r1Img, b1Img, r1Img);
+        
+        cvCvtColor(pFrame,hsvImg,CV_BGR2HSV);
+        cvSplit(hsvImg,hImg,sImg,vImg,NULL);
+        cvThreshold(hImg,h1Img,9,255,CV_THRESH_BINARY_INV);
+        cvThreshold(hImg,hImg,160,255,CV_THRESH_BINARY);
+        cvOr(hImg,h1Img,hImg);
+        cvThreshold(sImg,sImg,80,255,CV_THRESH_BINARY);
+        cvAnd(hImg,sImg,hImg);
+
+        cvOr(hImg, r1Img, hImg);        
+
+        cvFindContours(hImg,storage,&seq,sizeof(CvContour),CV_RETR_EXTERNAL);
+        cnt=0;
+        for (c=seq; c!=NULL; c=c->h_next){  
+            rc=cvBoundingRect(c,0);  
+            //CV_RGB(Blue,Green,Red)
+            if (rc.width>2){
+                x[cnt]=rc.x+rc.width/2;
+                y[cnt]=rc.y+rc.height/2;
+                cvDrawRect(pFrame, cvPoint(rc.x, rc.y), cvPoint(rc.x + rc.width, rc.y + rc.height), CV_RGB(0,0,255));  
+                cnt++;
+            }
+            if (cnt==4){
+                break;
+            }
+        }
+        if (cnt==4){
+            for (i=0;i<4;i++){
+                a[2*i]=x[i];
+                a[2*i+1]=y[i];
+            }
+            psort(a);
+            for (i=0;i<4;i++){
+                x[i]=a[2*i];
+                y[i]=a[2*i+1];
+                x[i]-=160;
+                y[i]-=128;
+                x[i]=-x[i];
+                y[i]=-y[i];
+            }
+        }else {
+            isfirst=true;
+            reason=1;
+        }
+        outfile<<ros::Time::now()<<"\t";
+        for (i=0;i<4;i++){
+            outfile<<x[i]<<"\t";
+        }
+        for (i=0;i<4;i++){
+            outfile<<y[i]<<"\t";
+        }
+        //cvShowImage("video",pFrame);
+        cvWaitKey(1);
+         
+         // 图像当中的坐标转化为CMOS的坐标
+        for (i=0;i<4;i++){
+            x[i]*=4*0.000003;
+            y[i]*=4*0.000003;
+        }
+        /***************************************
+        *
+        * Initialize
+        *
+        ***************************************/
+        outfile<<reason<<"\t"<<isfirst<<"\t"<<cnt<<"\t";
+        
+        //旋转矩阵
+        Rx4<<   1,    0,            0,
+                0,    cos(roll),    -sin(roll),
+                0,    sin(roll),    cos(roll);
+       
+        Rx5<<   cos(pitch),     0,  sin(pitch),
+                0,              1,  0,
+                -sin(pitch),    0,  cos(pitch);
+        
+        R=Rx4*Rx5;
+        
+        tmph<<0,0,1;
+
+        //u v 是机体坐标系中的坐标
+        for (i=0;i<4;i++){
+            tmpv_arr[i]<<x[i],y[i],fl; 
+            m[i]=fl/(tmph*R*tmpv_arr[i]);
+            p[i]=m[i]*R*tmpv_arr[i];
+            u[i]=p[i](0);
+            v[i]=p[i](1);
+        }
+
+        for (i=0;i<4;i++){
+            outfile<<u[i]/4/0.000003<<"\t";
+        }
+        for (i=0;i<4;i++){
+            outfile<<v[i]/4/0.000003<<"\t";
+        }
+
+        //a1是一个高度的量
+        m10=u[0]+u[1]+u[2]+u[3];    m00=4;
+        m01=v[0]+v[1]+v[2]+v[3];
+        ug=m10/m00; vg=m01/m00;
+
+        u20=(u[0]-ug)*(u[0]-ug)+(u[1]-ug)*(u[1]-ug)
+            +(u[2]-ug)*(u[2]-ug)+(u[3]-ug)*(u[3]-ug);
+        u02=(v[0]-vg)*(v[0]-vg)+(v[1]-vg)*(v[1]-vg)
+            +(v[2]-vg)*(v[2]-vg)+(v[3]-vg)*(v[3]-vg);
+        u11=(u[0]-ug)*(v[0]-vg)+(u[1]-ug)*(v[1]-vg)
+            +(u[2]-ug)*(v[2]-vg)+(u[3]-ug)*(v[3]-vg); 
+        a1=u20+u02;
+        if (ad/a1<5){
+            qz=sqrt(ad/a1); 
+        }else{
+            qz=sqrt(5);
+        }
+        qx=qz*ug/fl; qy=qz*vg/fl;
+        alpha=0.5*atan((2*u11)/(u20-u02));
+        q4=alpha-alphad;
+
+        q<<qx,qy,qz;
+        tmpv<<qxd,qyd,qzd;
+
+        //q1是误差向量
+        q1=q-tmpv;
+
+        if (isfirst){
+            isfirst=false;
+            reason=0;
+            voe.setZero();
+            dvoe.setZero();
+            qe1=q1;
+            dqe1.setZero();
+            f.setZero();
+            qee.setZero();
+            ve.setZero();
+            thrustd.data=thr_sp;
+            hd=z;
+            pE=0;iE=0;dE=0;ek=0;ek1=0;ek2=0;
+        }
+
+
+        voe=voe+dvoe*dt;    qe1=qe1+dqe1*dt;
+        qee=q1-qe1;
+
+        //ve是估计的速度向量
+        ve=voe-k2*qee;
+        tmpv<<0,0,yawspeed;
+        dvoe=-tmpv.cross(ve)+f-k1*k2*qee-qee/zd; 
+        dqe1=-ve/zd-tmpv.cross(q1)+k1*qee;
+        q2=q1-ve/c1;
+
+        //f是三个方向的加速度向量
+        //zd是高度期望值
+        f=qee/zd+c1*c2*q2+c1*c1*q2/zd;
+
+        outfile<<a1<<"\t"
+                <<q1(0)<<"\t"<<q1(1)<<"\t"<<q1(2)<<"\t"
+                <<qee(0)<<"\t"<<qee(1)<<"\t"<<qee(2)<<"\t"
+                <<ve(0)<<"\t"<<ve(1)<<"\t"<<ve(2)<<"\t"
+                <<voe(0)<<"\t"<<voe(1)<<"\t"<<voe(2)<<"\t"
+                <<dvoe(0)<<"\t"<<dvoe(1)<<"\t"<<dvoe(2)<<"\t"
+                <<qe1(0)<<"\t"<<qe1(1)<<"\t"<<qe1(2)<<"\t"
+                <<dqe1(0)<<"\t"<<dqe1(1)<<"\t"<<dqe1(2)<<"\t"
+                <<q2(0)<<"\t"<<q2(1)<<"\t"<<q2(2)<<"\t"
+                <<f(0)<<"\t"<<f(1)<<"\t"<<f(2)<<"\t";
+        
+        tmpv<<0,0,9.81;
+        tmph<<cos(roll)*sin(pitch), -sin(roll), cos(roll)*cos(pitch);
+        
+        //竖直方向升力
+        u1=mass*tmph*(tmpv-f); 
+
+        //rolld和pitchd是期望的姿态角
+        if (mass*f(1)/u1<-rp_thr){
+            rolld=asin(-rp_thr);
+        }else if(mass*f(1)/u1>rp_thr){
+            rolld=asin(rp_thr);
+        }else {
+            rolld=asin(mass*f(1)/u1);
+        }
+
+        if (-mass*f(0)/(u1*cos(rolld))<-rp_thr){
+            pitchd=asin(-rp_thr);
+        }else if(-mass*f(0)/(u1*cos(rolld))>rp_thr){
+            pitchd=asin(rp_thr);
+        }else{
+            pitchd=asin(-mass*f(0)/(u1*cos(rolld)));
+        }
+        
+        if (u1>20){
+            u1=20;
+        }else if (u1<10){
+            u1=10;
+        }
+
+        hd=z+(u1-gra)*0.4;
+
+        ek=z-hd;
+        pE=ek-ek1;
+        iE=ek;
+        dE=ek-ek1*2+ek2;
+        ek2=ek1;
+        ek1=ek;
+        thrustd.data=kp*pE+ki*iE+kd*dE+thrustd.data;
+        //thrustd.data=(u1-gra)/100+thr_sp;
+
+        if (thrustd.data>0.77){
+            thrustd.data=0.77;
+        }else if (thrustd.data<0.55){
+            thrustd.data=0.55;
+        }
+        pitchd+=p_err;
+        rolld+=r_err;
+        outfile<<u1<<"\t"<<(rolld-r_err)/1.1<<"\t"<<pitchd-p_err<<"\t"<<thrustd.data<<"\t"
+                <<roll<<"\t"<<pitch<<"\t"<<roll1<<"\t"<<pitch1<<"\t"
+                <<yawspeed<<endl;
+
+        roll=roll2;
+        roll2=roll1;
+        pitch=pitch2;
+        pitch2=pitch1;
+        
+        if (isfirst){
+            mavlink_euler_to_quaternion(0,0,0,quat);
+            thrustd.data=thr_sp;
+        }else{
+            mavlink_euler_to_quaternion(rolld,-pitchd,0,quat);
+        }
+        //mavlink_euler_to_quaternion(rolld,-pitchd,3.1415,quat);
+        //thrustd.data=0.2;
+        attitude.pose.orientation.x=quat[1];
+        attitude.pose.orientation.y=quat[2];
+        attitude.pose.orientation.z=quat[3];
+        attitude.pose.orientation.w=quat[0];
+        ROS_INFO("%f",yaw);
+        if (current_state.mode=="OFFBOARD"){
+            if (piccnt == 4){
+                cvWriteFrame(writer,pFrame);
+                piccnt=0;
+            }else {
+                piccnt++;
+            }
+
+            att_pub.publish(attitude);
+            att_thr_pub.publish(thrustd);
+        }else{
+            isfirst=true; 
+            reason=2;
+            //ROS_INFO("%s",current_state.mode.c_str());
+            //ROS_INFO(" ");
+            att_pub.publish(attitude);
+            att_thr_pub.publish(thrustd);
+        }
+
+        ros::spinOnce();
+        rate.sleep();
+    }
+    cvReleaseCapture(&pCapture);
+    cvReleaseVideoWriter(&writer);
+    //cvDestroyWindow("video");
+    outfile.close();
+    return 0;
+}
+
