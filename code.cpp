@@ -1,6 +1,8 @@
 #include <ros/ros.h>
 //#include <mavros_msgs/mavlink_convert.h>
 #include <geometry_msgs/PoseStamped.h>
+
+
 #include <std_msgs/Float64.h>
 #include <mavros_msgs/CommandBool.h>
 #include <mavros_msgs/State.h>
@@ -33,9 +35,9 @@ mavros_msgs::Mavlink current_mav;
 //mavlink_attitude_t attitude;
 //mavlink_local_position_ned_t localpos;
 
-geometry_msgs::PoseStamped pose;
+geometry_msgs::PoseStamped pose,npose;
 geometry_msgs::PoseStamped current_position;
-mavros_msgs::ActuatorControl current_control;
+mavros_msgs::ActuatorControl current_control, next_control;
 
 void state_cb(const mavros_msgs::State::ConstPtr& msg){
     current_state = *msg;
@@ -78,7 +80,7 @@ int main(int argc, char **argv)
     * Flying log 
     *
     ***************************************/
-
+    ofstream outfile("log.txt");
 
     
     ifstream infile("para.txt");
@@ -97,7 +99,7 @@ int main(int argc, char **argv)
     ros::Subscriber cont_sub = cont_sub_handle.subscribe<mavros_msgs::ActuatorControl>
             ("mavros/actuator_control",10, control_cb);
     ros::Subscriber pose_sub = pose_sub_handle.subscribe<geometry_msgs::PoseStamped>
-            ("mavros/setpoint_position/local",10, position_cb);
+            ("mavros/local_position/pose",10, position_cb);
 
     ros::Publisher pose_pub = pose_pub_handle.advertise<geometry_msgs::PoseStamped>
             ("mavros/setpoint_position/local", 10);
@@ -119,7 +121,7 @@ int main(int argc, char **argv)
     *
     ***************************************/
     Mat pFrame;
-    VideoCapture pCapture(0);    // -1 means to prompt a window of cameras for user to choose
+    VideoCapture pCapture(1);    // -1 means to prompt a window of cameras for user to choose
     if(!pCapture.isOpened()) return 0;
     //Frame Width and Height
     //cvSetCaptureProperty(pCapture, CV_CAP_PROP_FRAME_WIDTH, 480);
@@ -143,28 +145,61 @@ int main(int argc, char **argv)
     ***************************************/
     int piccnt = 0;
     bool isfirst = true;
+    bool tocatch = false;
 
 
     while(ros::ok()) {
         //pFrame=cvQueryFrame( pCapture );
         pCapture >> pFrame;
+        imshow("video",pFrame);
         vector<double> dpose = detect_red_point(pFrame);
 
         dx = dpose[0];
         dy = dpose[1];
         r = dpose[2];
         num = dpose[3];
-
-        dposex = dx/r;
-        dposey = dy/r;
-        if(dposex+dposey<threshold) dposez = 1;
-        if(num==0) dposez = 0;
+        if(r == 0 && !tocatch){
+            dposex = 0;
+            dposey = 0;
+            dposez = 0;
+        }else if(r > 200 || tocatch){
+            dposex = 0;
+            dposey = 0;
+            dposez = 1;
+            tocatch = true;
+        }else{
+            dposex = dx/r;
+            dposey = dy/r;
+            if(dposex+dposey<threshold) dposez = 1;
+            if(num==0) dposez = 0;
+        }
         
-        pose.pose.position.x += dposex;
-        pose.pose.position.y += dposey;
-        pose.pose.position.z += dposez;
+        if(isfirst){
+            isfirst = false;
+            npose.pose.orientation = pose.pose.orientation;
+        }
 
+        cout << pose.pose.position.x << ' ' << pose.pose.position.y << ' ' << pose.pose.position.z << endl;
+        cout << dposex << ' ' << dposey << ' ' << dposez << endl;
+
+        npose.pose.position.x = pose.pose.position.x - kp*dposex*1e-16;
+        npose.pose.position.y = pose.pose.position.y - kp*dposey*1e-32;
+        npose.pose.position.z = pose.pose.position.z + kp*dposez;
+        cout << npose.pose.position.x << ' ' << npose.pose.position.y << ' ' << npose.pose.position.z << endl;
+        cout << r << endl;
+        
+        //for(int i=0;i<8;i++) next_control.controls[i] = current_control.controls[i];
+       // next_control = current_control;
+        
+        //for(int i=0;i<8;i++) cout << current_control.controls[i] << ' ';
+        //cout <<  endl << endl;
+
+        cout << current_state.mode << endl << endl;
         if (current_state.mode=="OFFBOARD"){
+            //next_control.controls[7] = -0.7;
+            //next_control.group_mix = 2;
+            //cont_pub.publish(next_control);
+
             if (piccnt == 4){
                 writer << pFrame;
                 piccnt=0;
@@ -172,20 +207,27 @@ int main(int argc, char **argv)
                 piccnt++;
             }
 
-            pose_pub.publish(pose);
+            pose_pub.publish(npose);
+
+            if(tocatch){
+                next_control.controls[7] = -0.7;
+                //next_control.group_mix = 2;
+                cont_pub.publish(next_control);
+            }
         }else{
             isfirst=true; 
 
-            pose_pub.publish(pose);
+            pose_pub.publish(npose);
         }
 
         ros::spinOnce();
         rate.sleep();
+        if (cvWaitKey(1) >= 0) break;
     }
     //cvReleaseCapture(&pCapture);
     //cvReleaseVideoWriter(&writer);
-    //cvDestroyWindow("video");
-    //outfile.close();
+    cvDestroyWindow("video");
+    outfile.close();
     return 0;
 }
 
